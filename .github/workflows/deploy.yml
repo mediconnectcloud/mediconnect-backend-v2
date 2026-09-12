@@ -1,0 +1,153 @@
+name: CI/CD Pipeline - Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  NODE_VERSION: '20'
+  APP_NAME: 'mediconnect-backend'
+
+jobs:
+  # Job 1: Build and Test
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Build project
+        run: npm run build
+        
+      - name: Upload build artifacts
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ github.sha }}
+          path: dist/
+          retention-days: 1
+          
+      - name: Upload package files
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-files-${{ github.sha }}
+          path: |
+            package.json
+            package-lock.json
+          retention-days: 1
+
+  # Job 2: Deploy to EC2 (only on main/develop push)
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ github.sha }}
+          path: dist/
+          
+      - name: Download package files
+        uses: actions/download-artifact@v4
+        with:
+          name: package-files-${{ github.sha }}
+          
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          
+      - name: Deploy to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
+          DEPLOYMENT_ENV: ${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$EC2_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
+          
+          # Create deployment package
+          tar -czf deployment.tar.gz dist/ package.json package-lock.json
+          
+          # Transfer to EC2
+          scp -i ~/.ssh/deploy_key deployment.tar.gz $EC2_USER@$EC2_HOST:/tmp/
+          
+          # Execute deployment script on EC2
+          ssh -i ~/.ssh/deploy_key $EC2_USER@$EC2_HOST << 'EOF'
+          set -e
+          
+          DEPLOYMENT_ENV=${{ env.DEPLOYMENT_ENV }}
+          APP_DIR="/home/ec2-user/apps/mediconnect-backend"
+          BACKUP_DIR="/home/ec2-user/backups"
+          
+          echo "=== Starting deployment to $DEPLOYMENT_ENV ==="
+          
+          # Create directories if they don't exist
+          mkdir -p $APP_DIR
+          mkdir -p $BACKUP_DIR
+          
+          # Backup current deployment
+          if [ -d "$APP_DIR/dist" ]; then
+            BACKUP_NAME="backup-$(date +%Y%m%d-%H%M%S)"
+            tar -czf "$BACKUP_DIR/$BACKUP_NAME.tar.gz" -C "$APP_DIR" dist/ package.json package-lock.json 2>/dev/null || true
+            echo "Backup created: $BACKUP_NAME"
+          fi
+          
+          # Extract and deploy new version
+          cd $APP_DIR
+          tar -xzf /tmp/deployment.tar.gz
+          
+          # Install production dependencies
+          npm ci --only=production
+          
+          # Restart the application using PM2
+          if command -v pm2 &> /dev/null; then
+            pm2 restart $APP_NAME || pm2 start dist/main.js --name $APP_NAME --env $DEPLOYMENT_ENV
+            pm2 save
+          else
+            echo "PM2 not found. Please install PM2 or use systemd service."
+          fi
+          
+          # Clean up
+          rm /tmp/deployment.tar.gz
+          
+          echo "=== Deployment completed successfully ==="
+          EOF
+          
+      - name: Notify deployment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = context.job.status === 'success' ? '✅ Success' : '❌ Failed';
+            const environment = context.ref === 'refs/heads/main' ? 'Production' : 'Staging';
+            console.log(`Deployment to ${environment}: ${status}`);
