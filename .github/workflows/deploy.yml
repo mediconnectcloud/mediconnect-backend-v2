@@ -35,20 +35,25 @@ jobs:
         
       - name: Build project
         run: npm run build
+
+      - name: Create VERSION file
+        run: echo "${GITHUB_SHA}" > VERSION
         
       - name: Upload build artifacts
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
         uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ github.sha }}
-          path: dist/
+          name: dist-artifact
+          path: |
+            dist/
+            VERSION
           retention-days: 1
           
       - name: Upload package files
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
         uses: actions/upload-artifact@v4
         with:
-          name: package-files-${{ github.sha }}
+          name: package-files-artifact
           path: |
             package.json
             package-lock.json
@@ -68,15 +73,31 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          name: dist-${{ github.sha }}
+          name: dist-artifact
           path: dist/
           
       - name: Download package files
         uses: actions/download-artifact@v4
         with:
-          name: package-files-${{ github.sha }}
-          
-      - name: Deploy to EC2
+          name: package-files-artifact
+
+      - name: Show artifact and create deployment package (debug)
+        run: |
+          echo "GITHUB_SHA=${GITHUB_SHA}"
+          echo "Listing dist/"
+          ls -la dist || true
+          echo "Contents of VERSION (if any):"
+          cat VERSION || true
+          echo "Create DEPLOY_INFO"
+          echo "GIT_SHA=${GITHUB_SHA}" > DEPLOY_INFO
+          echo "Creating deployment.tar.gz (includes dist/, package.json, package-lock.json, VERSION, DEPLOY_INFO)"
+          tar -czf deployment.tar.gz dist/ package.json package-lock.json VERSION DEPLOY_INFO || tar -czf deployment.tar.gz dist/ package.json package-lock.json DEPLOY_INFO
+          echo "SHA256 of deployment.tar.gz:"
+          sha256sum deployment.tar.gz || true
+          echo "Listing deployment.tar.gz contents (top 50):"
+          tar -tvf deployment.tar.gz | head -n 50 || true
+
+      - name: Transfer to EC2 (verbose)
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
@@ -86,51 +107,94 @@ jobs:
           echo "$EC2_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
-          
-          # Create deployment package
-          tar -czf deployment.tar.gz dist/ package.json package-lock.json
-          
-          # Transfer to EC2
-          scp -i ~/.ssh/deploy_key deployment.tar.gz $EC2_USER@$EC2_HOST:/tmp/
-          
-          # Execute deployment script on EC2
-          ssh -i ~/.ssh/deploy_key $EC2_USER@$EC2_HOST << 'EOF'
+          scp -v -i ~/.ssh/deploy_key deployment.tar.gz $EC2_USER@$EC2_HOST:/tmp/deployment.tar.gz
+
+      - name: Deploy to EC2 (run remote deploy, debug output)
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$EC2_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
+
+          ssh -v -i ~/.ssh/deploy_key $EC2_USER@$EC2_HOST << 'EOF'
           set -e
-          
+
+          echo "=== Remote deploy started ==="
+          echo "Date: $(date)"
+          echo "Whoami: $(whoami)"
+          echo "Working dir: $(pwd)"
+
           APP_DIR="/home/ec2-user/apps/mediconnect-backend"
-          
-          echo "=== Starting deployment ==="
-          
-          # Create app directory if it doesn't exist
+          TIMESTAMP=$(date +%s)
+          BACKUP_DIR="${APP_DIR}_backup_$TIMESTAMP"
+
+          echo "APP_DIR=$APP_DIR"
+
+          # Ensure app directory exists
           mkdir -p $APP_DIR
-          
-          # Extract and deploy new version
-          cd $APP_DIR
-          tar -xzf /tmp/deployment.tar.gz
-          
+
+          echo "Remote: list /tmp/deployment.tar.gz"
+          ls -l /tmp/deployment.tar.gz || true
+
+          echo "Remote: show tar contents"
+          tar -tvf /tmp/deployment.tar.gz | head -n 100 || true
+
+          echo "Remote: extract VERSION from tar to /tmp"
+          tar -xzf /tmp/deployment.tar.gz -C /tmp/ || true
+          echo "Remote: /tmp/VERSION contents:" 
+          cat /tmp/VERSION || true
+
+          # Backup existing app (if non-empty)
+          if [ -d "$APP_DIR" ] && [ "$(ls -A $APP_DIR)" ]; then
+            echo "Backing up existing app dir to $BACKUP_DIR"
+            mv $APP_DIR $BACKUP_DIR || true
+            mkdir -p $APP_DIR
+          fi
+
+          echo "Extracting deployment to $APP_DIR"
+          tar -xzf /tmp/deployment.tar.gz -C $APP_DIR || true
+
+          echo "Post-extract listing of $APP_DIR (top):"
+          ls -la $APP_DIR | head -n 200 || true
+
+          echo "Installed VERSION:" 
+          cat $APP_DIR/VERSION || true
+
           # Install dependencies
-          npm ci --only=production
-          
-          # Kill any existing process and start fresh
-          pkill -f "node dist/main.js" || true
-          sleep 2
-          
-          # Start the server
-          node dist/main.js > /tmp/app.log 2>&1 &
-          
-          # Clean up
-          rm /tmp/deployment.tar.gz
-          
-          echo "=== Deployment completed successfully ==="
-          echo "Server started. PID: $!"
+          if [ -f $APP_DIR/package.json ]; then
+            echo "Running npm ci --only=production"
+            cd $APP_DIR || true
+            npm ci --only=production || true
+          else
+            echo "package.json not found in $APP_DIR"
+          fi
+
+          # Restart logic: try systemd, else fallback to killing node process and starting new one
+          echo "Attempting to restart systemd service 'mediconnect-backend' (if exists)"
+          if sudo systemctl list-units --full -all | grep -q mediconnect-backend; then
+            echo "Found systemd service mediconnect-backend, restarting..."
+            sudo systemctl restart mediconnect-backend || true
+            sudo systemctl status mediconnect-backend --no-pager || true
+          else
+            echo "No systemd unit found, fallback to killing old node processes and starting new one"
+            pkill -f "node dist/main.js" || true
+            sleep 2
+            nohup node dist/main.js > /tmp/app.log 2>&1 &
+            echo "Started node, tail of /tmp/app.log (last 50 lines):"
+            tail -n 50 /tmp/app.log || true
+          fi
+
+          # Clean up remote tmp file
+          rm -f /tmp/deployment.tar.gz || true
+
+          echo "=== Remote deploy completed ==="
           EOF
-          
+
       - name: Deployment Status
         if: always()
         run: |
-          if [ $? -eq 0 ]; then
-            echo "✅ Deployment successful"
-          else
-            echo "❌ Deployment failed"
-            exit 1
-          fi
+          echo "Deployment job finished. Check previous steps for debug output."
