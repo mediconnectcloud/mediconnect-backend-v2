@@ -104,7 +104,6 @@ export const doctors: Doctor[] = [
   { id: 'DOC-14', providerId: 'PRV-102', name: 'Dr. Grace Wilson', specialization: 'Dentistry', fee: 90 },
   { id: 'DOC-15', providerId: 'PRV-103', name: 'Dr. Noah Campbell', specialization: 'Physiotherapy', fee: 70 },
   { id: 'DOC-16', providerId: 'PRV-104', name: 'Dr. Priya Nair', specialization: 'General Practice', fee: 60 },
-  { id: 'DOC-17', providerId: 'PRV-105', name: 'Dr. Arya Singh', specialization: 'Cardiologist', fee: 100},
 ];
 
 export const slots: Slot[] = [

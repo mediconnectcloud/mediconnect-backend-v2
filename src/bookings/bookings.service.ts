@@ -1,52 +1,145 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { bookings, doctors, providers, slots, Booking, makeBookingId } from '../common/data/seed';
+import { ConditionalCheckFailedException } from '@aws-sdk/client-dynamodb';
+import { GetCommand, QueryCommand, TransactWriteCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { ddb, TABLES } from '../common/dynamodb/dynamodb.client';
+import { DoctorsService } from '../doctors/doctors.service';
+import { ProvidersService } from '../providers/providers.service';
+
+export interface Booking {
+  bookingId: string;
+  patientUsername: string;
+  doctorId: string;
+  doctorName: string;
+  providerId: string;
+  providerName: string;
+  date: string;
+  time: string;
+  status: 'confirmed' | 'cancelled' | 'completed' | 'no-show';
+}
+
+function makeBookingId(): string {
+  return `BKG-${Date.now().toString().slice(-6)}`;
+}
 
 @Injectable()
 export class BookingsService {
-  // Mirrors the DynamoDB transaction described in the architecture plan:
-  // check the slot is still available, mark it booked, then create the
-  // booking record. In DynamoDB this becomes a single TransactWriteItems
-  // call so the two writes can never happen only halfway.
-  create(patientUsername: string, slotId: string): Booking {
-    const slot = slots.find((s) => s.id === slotId);
+  constructor(
+    private readonly doctorsService: DoctorsService,
+    private readonly providersService: ProvidersService,
+  ) {}
+
+  // The one transactional flow in the system. Looks up the slot via its
+  // GSI, then names the doctor/provider (reusing the same services those
+  // features already have, rather than querying DynamoDB a second way),
+  // then writes both the slot update and the new booking as a single
+  // TransactWriteItems call - so the two writes can never happen only
+  // halfway. A ConditionExpression on the slot guards against two people
+  // booking the exact same slot at the exact same moment: whichever
+  // request's transaction commits first wins, the second is rejected by
+  // DynamoDB itself, not by application logic racing against itself.
+  async create(patientUsername: string, slotId: string): Promise<Booking> {
+    const slotResult = await ddb.send(
+      new QueryCommand({
+        TableName: TABLES.SLOTS,
+        IndexName: 'slotId-index',
+        KeyConditionExpression: 'slotId = :slotId',
+        ExpressionAttributeValues: { ':slotId': slotId },
+      }),
+    );
+    const slot = slotResult.Items?.[0];
     if (!slot || slot.status !== 'available') {
       throw new BadRequestException('Sorry, that slot is no longer available.');
     }
 
-    const doctor = doctors.find((d) => d.id === slot.doctorId);
-    const provider = doctor ? providers.find((p) => p.id === doctor.providerId) : undefined;
+    const doctor = await this.doctorsService.findOne(slot.doctorId).catch(() => null);
+    const provider = doctor ? await this.providersService.findOne(doctor.providerId).catch(() => null) : null;
 
-    slot.status = 'booked';
-
-    const newBooking: Booking = {
-      id: makeBookingId(),
+    const booking: Booking = {
+      bookingId: makeBookingId(),
       patientUsername,
-      doctorId: doctor?.id ?? slot.doctorId,
+      doctorId: slot.doctorId,
       doctorName: doctor?.name ?? 'Unknown doctor',
+      providerId: doctor?.providerId ?? 'Unknown',
       providerName: provider?.name ?? 'Unknown provider',
       date: slot.date,
       time: slot.time,
       status: 'confirmed',
     };
-    bookings.push(newBooking);
-    return newBooking;
+
+    try {
+      await ddb.send(
+        new TransactWriteCommand({
+          TransactItems: [
+            {
+              Update: {
+                TableName: TABLES.SLOTS,
+                Key: { doctorId: slot.doctorId, dateTime: slot.dateTime },
+                UpdateExpression: 'SET #status = :booked',
+                ConditionExpression: '#status = :available',
+                ExpressionAttributeNames: { '#status': 'status' },
+                ExpressionAttributeValues: { ':booked': 'booked', ':available': 'available' },
+              },
+            },
+            {
+              Put: { TableName: TABLES.BOOKINGS, Item: booking },
+            },
+          ],
+        }),
+      );
+    } catch (err) {
+      if (err instanceof ConditionalCheckFailedException) {
+        throw new BadRequestException('Sorry, that slot was just booked by someone else.');
+      }
+      throw err;
+    }
+
+    return booking;
   }
 
-  findMine(patientUsername: string): Booking[] {
-    return bookings.filter((b) => b.patientUsername === patientUsername);
-    // Real version (DynamoDB): Query the patientId GSI on the Bookings table.
+  // Query the patientUsername-index GSI - one Query answers "my bookings"
+  // with no follow-up lookups needed.
+  async findMine(patientUsername: string): Promise<Booking[]> {
+    const result = await ddb.send(
+      new QueryCommand({
+        TableName: TABLES.BOOKINGS,
+        IndexName: 'patientUsername-index',
+        KeyConditionExpression: 'patientUsername = :u',
+        ExpressionAttributeValues: { ':u': patientUsername },
+      }),
+    );
+    return (result.Items as Booking[]) || [];
   }
 
-  findForProvider(providerId: string): Booking[] {
-    const providerDoctorIds = doctors.filter((d) => d.providerId === providerId).map((d) => d.id);
-    return bookings.filter((b) => providerDoctorIds.includes(b.doctorId));
-    // Real version (DynamoDB): Query the providerId GSI on the Bookings table.
+  // Query the providerId-index GSI - now a single Query, since providerId
+  // is stored directly on each booking (see create() above) instead of
+  // needing a separate doctor lookup per booking to work out which clinic
+  // it belongs to.
+  async findForProvider(providerId: string): Promise<Booking[]> {
+    const result = await ddb.send(
+      new QueryCommand({
+        TableName: TABLES.BOOKINGS,
+        IndexName: 'providerId-index',
+        KeyConditionExpression: 'providerId = :p',
+        ExpressionAttributeValues: { ':p': providerId },
+      }),
+    );
+    return (result.Items as Booking[]) || [];
   }
 
-  updateStatus(id: string, status: Booking['status']): Booking {
-    const found = bookings.find((b) => b.id === id);
-    if (!found) throw new NotFoundException(`Booking ${id} not found`);
-    found.status = status;
-    return found;
+  async updateStatus(id: string, status: Booking['status']): Promise<Booking> {
+    const existing = await ddb.send(new GetCommand({ TableName: TABLES.BOOKINGS, Key: { bookingId: id } }));
+    if (!existing.Item) throw new NotFoundException(`Booking ${id} not found`);
+
+    const result = await ddb.send(
+      new UpdateCommand({
+        TableName: TABLES.BOOKINGS,
+        Key: { bookingId: id },
+        UpdateExpression: 'SET #status = :status',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':status': status },
+        ReturnValues: 'ALL_NEW',
+      }),
+    );
+    return result.Attributes as Booking;
   }
 }
